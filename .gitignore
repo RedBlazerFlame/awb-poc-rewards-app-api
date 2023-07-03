@@ -1,0 +1,9 @@
+.env
+relevant_links.txt
+cert.pem
+key.pem
+flask_config.py
+flask_session
+flask_session/*
+__pycache__
+__pycache__/*
