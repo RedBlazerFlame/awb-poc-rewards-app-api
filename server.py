@@ -147,17 +147,54 @@ def home():
 #     res = get_users_by_field(field('user_info', 'email'), email, fields_to_get)
 #     return list(map(map_user_info_fields, res))
 
+loyalty_program_id = query('loyalty.program', 'search',
+                           [[('name', '=', 'Loyalty Program')]])[0]
+awb_admin_id = query('res.partner', 'search', [[('display_name', '=', 'awb-admin')]])[0]
 
 @app.route("/user/user_info", methods=['GET'])
 def get_user_info():
   if ('customer_id' not in session):
     return "You are not logged in!", 401
-  customer_id = session[customer_id]
+  customer_id = session['customer_id']
   fields_to_get = field_l('user_info',
                           ['username', 'phone_number', 'email', 'customer_id'])
   res = get_users_by_field(field('user_info', 'customer_id'), customer_id,
                            fields_to_get)
   return list(map(map_user_info_fields, res))
+
+@app.route("/user/user_info/rewards_points", methods=['GET'])
+def get_user_info_rewards_points():
+  if ('customer_id' not in session):
+    return "You are not logged in!", 401
+  customer_id = session['customer_id']
+  fields_to_get = ['points']
+  res = get_by_field('loyalty.card', 'code', customer_id,
+                           fields_to_get)
+  return {
+    'points': res[0]['points']
+  }
+
+@app.route("/user/user_info/rewards_points_history", methods=['GET'])
+def get_user_info_rewards_points_history():
+  if ('customer_id' not in session):
+    return "You are not logged in!", 401
+  loyalty_card_id = session['loyalty_card_id']
+  messages = query('mail.message', 'search_read', [[('author_id', '=', awb_admin_id), ('model', '=', 'loyalty.card'), ('res_id', '=', loyalty_card_id)]], {'fields': ['date', 'tracking_value_ids']})
+  
+  messages_with_processed_datetime = list(map(lambda x: {**x, 'date': datetime.strptime(x['date'], "%Y-%m-%d %H:%M:%S")}, messages))
+  
+  messages_with_processed_datetime.sort(key=lambda x: x['date'])
+  messages_with_processed_datetime = list(reversed(messages_with_processed_datetime))
+  message_tracking_ids = list(map(lambda x: x['tracking_value_ids'][0], filter(lambda x: len(x['tracking_value_ids']) > 0, messages_with_processed_datetime)))
+  
+  history = query('mail.tracking.value', 'read', [message_tracking_ids], {'fields': ['old_value_float', 'new_value_float']})
+  
+  history_with_datetimes = list(map(lambda x: {'old': x[0]['old_value_float'], 'new': x[0]['new_value_float'], 'date': {
+     (field): getattr(x[1], field) for field in ['year', 'month', 'day', 'hour', 'minute', 'second']
+  }}, zip(history, map(lambda x: x['date'], messages_with_processed_datetime))))
+  return {
+    'history': history_with_datetimes
+  }
 
 
 @app.route("/user/update_user", methods=['POST'])
@@ -176,6 +213,7 @@ def update_user_by_customer_id():
   customer = customer[0]
 
   fields_to_update = ['username', 'phone_number', 'email']
+  contact_fields_to_update = ['name', 'phone', 'email']
   email = request.json.get('email')
   phone_number = request.json.get('phone_number')
   username = request.json.get('username')
@@ -207,6 +245,12 @@ def update_user_by_customer_id():
                 for field_name in filter(
                   lambda field_name: request.json.get(field_name) is not None,
                   fields_to_update)}])
+
+  query('res.partner', 'write', [[session['contact_id']], {(contact_field_name): request.json.get(field_name)
+                for field_name, contact_field_name in filter(
+                  lambda x: request.json.get(x[0]) is not None,
+                  zip(fields_to_update, contact_fields_to_update))}])
+  
   return f"Successfully updated customer {session['customer_id']}"
 
 
@@ -243,18 +287,40 @@ def sign_up_user():
       0):
     return "Phone number is not unique", 400
 
-  res = query(full_model_name('user_info'), 'create',
-              [{
-                field('user_info', 'email'): email,
-                field('user_info', 'username'): username,
-                field('user_info', 'phone_number'): phone_number,
-                field('user_info', 'customer_id'): customer_id,
-                field('user_info', 'account_type'): 'normal',
-                field('user_info', 'password'): pwd_hash,
-              }])
+  contact_id = query('res.partner', 'create', [{
+      (field('res_partner', 'customer_id')): customer_id,
+      'name': username,
+      'phone': phone_number,
+      'email': email,
+      'is_company': False,
+  }])
+  loyalty_card_id = query('loyalty.card', 'create', [{
+      'code': customer_id,
+      'points': 0,
+      'program_id': loyalty_program_id,
+      'partner_id': contact_id,
+    }])
+  res = query(full_model_name('user_info'), 'create', [{
+    field('user_info', 'email'):
+    email,
+    field('user_info', 'username'):
+    username,
+    field('user_info', 'phone_number'):
+    phone_number,
+    field('user_info', 'customer_id'):
+    customer_id,
+    field('user_info', 'account_type'):
+    'normal',
+    field('user_info', 'password'):
+    pwd_hash,
+    field('user_info', 'loyalty_card_id'): loyalty_card_id,
+    field('user_info', 'contact_id'): contact_id
+  }])
 
   session.permanent = True
   session['customer_id'] = customer_id
+  session['contact_id'] = contact_id
+  session['loyalty_card_id'] = loyalty_card_id
 
   return "Successfully created an account", 200
 
@@ -266,7 +332,7 @@ def log_in_user():
   password = request.json.get('password')
   res = []
   fields_to_get = field_l('user_info',
-                          ['password', 'account_type', 'customer_id'])
+                          ['password', 'account_type', 'customer_id', 'loyalty_card_id', 'contact_id'])
 
   if (password is None):
     return "A password must be provided", 400
@@ -291,6 +357,8 @@ def log_in_user():
   if (check_pwd(password, res[0][field('user_info', 'password')])):
     session.permanent = True
     session['customer_id'] = res[0][field('user_info', 'customer_id')]
+    session['contact_id'] = res[0][field('user_info', 'contact_id')]
+    session['loyalty_card_id'] = res[0][field('user_info', 'loyalty_card_id')]
     return "Successfully authenticated", 200
   else:
     return "The password provided is incorrect", 400
@@ -298,10 +366,10 @@ def log_in_user():
 
 @app.route("/user/log_out/", methods=['POST'])
 def log_out_user():
-  if ('customer_id' in session):
-    session.pop('customer_id', None)
+  for key in list(session.keys()):
+    session.pop(key, None)
   return "You are no longer logged in", 200
 
 
 if __name__ == "__main__":
-  app.run(port = PORT, host=HOST, debug=True)
+  app.run(port=PORT, host=HOST, debug=False)
